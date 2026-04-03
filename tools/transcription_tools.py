@@ -547,7 +547,14 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
-        model_name = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        requested_model = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        # Callers sometimes pass the generic ``stt.model`` value (e.g. "whisper-1")
+        # even when the active provider is local faster-whisper. Normalize any
+        # cloud-only aliases back to a valid local model to avoid runtime errors.
+        if requested_model in OPENAI_MODELS or requested_model in GROQ_MODELS:
+            model_name = local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        else:
+            model_name = requested_model
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":

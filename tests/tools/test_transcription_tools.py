@@ -804,6 +804,17 @@ class TestTranscribeAudioDispatch:
 
         assert mock_local.call_args[0][1] == "small"
 
+    def test_local_provider_normalizes_cloud_model_override(self, sample_ogg):
+        config = {"local": {"model": "base"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "hi"}) as mock_local:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_ogg, model="whisper-1")
+
+        assert mock_local.call_args[0][1] == "base"
+
     def test_config_openai_model_used(self, sample_ogg):
         config = {"openai": {"model": "gpt-4o-transcribe"}}
         with patch("tools.transcription_tools._load_stt_config", return_value=config), \
