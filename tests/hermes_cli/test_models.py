@@ -65,6 +65,14 @@ class TestOpenRouterModels:
         assert len(OPENROUTER_MODELS) >= 5
 
 
+class TestOpenAICodexModels:
+    def test_codex_catalog_includes_gpt_54(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+        codex_models = _PROVIDER_MODELS["openai-codex"]
+        assert "gpt-5.4" in codex_models
+        assert "gpt-5.4-mini" in codex_models
+
+
 class TestFindOpenrouterSlug:
     def test_exact_match(self):
         from hermes_cli.models import _find_openrouter_slug
