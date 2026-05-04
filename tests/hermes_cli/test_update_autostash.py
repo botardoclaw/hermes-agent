@@ -567,6 +567,50 @@ def test_cmd_update_no_checkout_when_already_on_main(monkeypatch, tmp_path):
     assert len(checkout_calls) == 0
 
 
+def test_cmd_update_prefers_upstream_when_origin_is_a_fork(monkeypatch, tmp_path):
+    """When origin is a fork and upstream exists, update should fetch/pull from upstream."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *a, **kw: "git@github.com:pablo/hermes-agent.git")
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_remote_url",
+        lambda _git_cmd, _cwd, remote: (
+            "https://github.com/NousResearch/hermes-agent.git"
+            if remote == "upstream"
+            else "git@github.com:pablo/hermes-agent.git"
+        ),
+    )
+    monkeypatch.setattr(hermes_main, "_install_python_dependencies_with_optional_fallback", lambda *a, **kw: None)
+
+    sync_calls = []
+    monkeypatch.setattr(hermes_main, "_sync_fork_with_upstream", lambda *a, **kw: sync_calls.append((a, kw)) or True)
+
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append(cmd)
+        if cmd == ["git", "fetch", "upstream"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..upstream/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "upstream", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "fetch", "upstream"] in recorded
+    assert ["git", "rev-list", "HEAD..upstream/main", "--count"] in recorded
+    assert ["git", "pull", "--ff-only", "upstream", "main"] in recorded
+    assert ["git", "fetch", "origin"] not in recorded
+    assert sync_calls
+
+
 # ---------------------------------------------------------------------------
 # Fetch failure — friendly error messages
 # ---------------------------------------------------------------------------
