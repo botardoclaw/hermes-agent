@@ -135,6 +135,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             server_name: str = "",
             preregistered: bool = False,
             token_user_agent: "str | None" = None,
+            oauth_flow_user_agent: "str | None" = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
@@ -149,6 +150,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_oauth_flow_user_agent = oauth_flow_user_agent
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -336,12 +338,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             )
 
             server_url = self.context.server_url
+            flow_ua = getattr(self, "_hermes_oauth_flow_user_agent", None)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # Step 1: PRM discovery to learn the authorization_server URL.
                 for url in build_protected_resource_metadata_discovery_urls(
                     None, server_url
                 ):
                     req = create_oauth_metadata_request(url)
+                    if flow_ua:
+                        req.headers["User-Agent"] = flow_ua
                     try:
                         resp = await client.send(req)
                     except httpx.HTTPError as exc:
@@ -365,6 +370,8 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self.context.auth_server_url, server_url
                 ):
                     req = create_oauth_metadata_request(url)
+                    if flow_ua:
+                        req.headers["User-Agent"] = flow_ua
                     try:
                         resp = await client.send(req)
                     except httpx.HTTPError as exc:
@@ -531,9 +538,20 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            first_yield = True
             try:
                 outgoing = await inner.__anext__()
                 while True:
+                    if first_yield:
+                        first_yield = False
+                    else:
+                        from tools.mcp_oauth import prepare_oauth_flow_request
+                        outgoing = prepare_oauth_flow_request(
+                            outgoing,
+                            server_url=getattr(self.context, "server_url", None),
+                            user_agent=getattr(self, "_hermes_oauth_flow_user_agent", None),
+                            context=self.context,
+                        )
                     incoming = yield outgoing
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
@@ -655,6 +673,7 @@ class MCPOAuthManager:
             _make_callback_waiter,
             _make_redirect_handler,
             cimd_provider_kwargs,
+            oauth_flow_user_agent,
             token_request_user_agent,
         )
 
@@ -706,6 +725,7 @@ class MCPOAuthManager:
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
             token_user_agent=token_request_user_agent(cfg),
+            oauth_flow_user_agent=oauth_flow_user_agent(cfg),
             **cimd_provider_kwargs(cfg),
         )
 
