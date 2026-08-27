@@ -130,6 +130,18 @@ class TestSendWithReplyToMode:
         assert len(calls) == 1
         assert calls[0].kwargs.get("reference") is None
 
+    @pytest.mark.asyncio
+    async def test_native_voice_message_never_gets_reply_reference(self):
+        """Discord mobile can render replies to voice bubbles as unloaded."""
+        adapter, channel, _ = _make_discord_adapter("first")
+        adapter._voice_message_reply_suppression_ids.add("999")
+
+        await adapter.send("12345", "voice transcript", reply_to="999")
+
+        calls = channel.send.call_args_list
+        assert len(calls) == 1
+        assert calls[0].kwargs.get("reference") is None
+
 
     @pytest.mark.asyncio
     async def test_first_mode_constructs_reference_without_fetch(self):
