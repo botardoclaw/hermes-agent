@@ -249,6 +249,37 @@ on another machine, it is session-scoped. Cover it with a test that asserts the
 GUI session gets the tool **with the env var absent** — that's the assertion
 the original gate could never have passed.
 
+## Local Fork Update Workflow (Pablo's VPS)
+
+This checkout has a personal fork and a long-lived local-fixes branch. Preserve
+that separation whenever updating Hermes:
+
+- `upstream` is the official NousResearch repository.
+- `origin` is Pablo's fork (`botardoclaw/hermes-agent`).
+- `main` is the clean update branch and tracks `upstream/main`; do not put
+  personal changes directly on it.
+- `pablo/hermes-local-fixes` contains Pablo's local fixes. Commit focused
+  changes there and push them to `origin`. Do **not** open an upstream PR unless
+  Pablo explicitly asks.
+
+Before an update, require a clean, pushed fixes branch. Then use this sequence:
+
+```bash
+# Update the clean official base (also updates dependencies / service as needed).
+hermes update --branch main --backup
+
+# Bring the updated base into the personal branch without rewriting its public history.
+git -C ~/.hermes/hermes-agent switch pablo/hermes-local-fixes
+git -C ~/.hermes/hermes-agent merge main
+git -C ~/.hermes/hermes-agent push
+```
+
+Use `merge main`, not rebase/force-push, because the fixes branch is a durable
+backup on the fork. Resolve conflicts in that branch, run targeted tests for
+changed subsystems, then push. `hermes update` may auto-stash uncommitted work,
+but intentional fixes must be committed and pushed first; do not rely on an
+autostash as their only backup.
+
 ## Development Environment
 
 ```bash
