@@ -1156,6 +1156,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # Discord clients can render a reply to a native voice-message bubble
+        # as "Message could not be loaded", even while the original audio is
+        # visible and usable. Keep voice-note replies flat; regular text reply
+        # threading remains unchanged. The IDs only live for this adapter
+        # process and Discord snowflakes are globally unique.
+        self._voice_message_reply_suppression_ids: set[str] = set()
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
@@ -3395,7 +3401,11 @@ class DiscordAdapter(BasePlatformAdapter):
         Mirrors telegram's _reply_to_message_id_for_send: raw reply_to in,
         platform send-time anchor out, ``off`` mode suppressed.
         """
-        if not reply_to or self._reply_to_mode == "off":
+        if (
+            not reply_to
+            or self._reply_to_mode == "off"
+            or str(reply_to) in self._voice_message_reply_suppression_ids
+        ):
             return None
         try:
             return self._message_reference_from_ids(reply_to, channel)
@@ -8224,7 +8234,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     elif att.content_type.startswith("video/"):
                         msg_type = MessageType.VIDEO
                     elif att.content_type.startswith("audio/"):
-                        if self._is_discord_voice_message_attachment(att):
+                        # discord.py normally exposes native voice-note metadata
+                        # through ``Attachment.is_voice_message()``. Some clients
+                        # send a captionless Opus/Ogg note without that metadata,
+                        # though; treating it as a generic attachment silently
+                        # bypasses inbound STT. A captionless Ogg/Opus attachment
+                        # is therefore a safe voice-note fallback. Captioned and
+                        # other audio uploads remain regular file attachments.
+                        _filename = (getattr(att, "filename", "") or "").lower()
+                        _captionless_opus_note = (
+                            not normalized_content.strip()
+                            and _filename.endswith((".ogg", ".opus"))
+                        )
+                        if self._is_discord_voice_message_attachment(att) or _captionless_opus_note:
                             msg_type = MessageType.VOICE
                         else:
                             msg_type = MessageType.AUDIO
@@ -8237,6 +8259,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     # the path to the agent.
                     msg_type = MessageType.DOCUMENT
                     break
+
+        if msg_type == MessageType.VOICE:
+            self._voice_message_reply_suppression_ids.add(str(message.id))
 
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
