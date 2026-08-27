@@ -1185,15 +1185,30 @@ def _get_hermes_oauth_provider_class() -> type | None:
         and WAFs reject httpx's default User-Agent there (#75576).
         """
 
-        def __init__(self, *args: Any, token_user_agent: "str | None" = None, **kwargs: Any):
+        def __init__(
+            self,
+            *args: Any,
+            token_user_agent: "str | None" = None,
+            oauth_flow_user_agent: "str | None" = None,
+            **kwargs: Any,
+        ):
             super().__init__(*args, **kwargs)
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_oauth_flow_user_agent = oauth_flow_user_agent
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
             if ua:
                 request.headers["User-Agent"] = ua
             return request
+
+        def _stamp_oauth_flow_user_agent(self, request):
+            return prepare_oauth_flow_request(
+                request,
+                server_url=getattr(self.context, "server_url", None),
+                user_agent=getattr(self, "_hermes_oauth_flow_user_agent", None),
+                context=self.context,
+            )
 
         def _coerce_client_secret_post(self) -> None:
             info = getattr(self.context, "client_info", None)
@@ -1215,6 +1230,27 @@ def _get_hermes_oauth_provider_class() -> type | None:
             self._coerce_client_secret_post()
             request = await super()._refresh_token()
             return self._stamp_token_user_agent(request)
+
+        async def async_auth_flow(self, request):
+            """Wrap the SDK's generator so Hermes can patch yielded requests.
+
+            This preserves the bidirectional ``.asend(response)`` contract while
+            allowing provider-specific fixes on the metadata/registration calls
+            the SDK constructs internally.
+            """
+            inner = super().async_auth_flow(request)
+            first_yield = True
+            try:
+                outgoing = await inner.__anext__()
+                while True:
+                    if first_yield:
+                        first_yield = False
+                    else:
+                        outgoing = self._stamp_oauth_flow_user_agent(outgoing)
+                    incoming = yield outgoing
+                    outgoing = await inner.asend(incoming)
+            except StopAsyncIteration:
+                return
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -1633,6 +1669,8 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 # different name via oauth.client_name if Figma ever admits one.
 _FIGMA_DCR_CLIENT_NAME = "Claude Code"
 _FIGMA_DEFAULT_SCOPE = "mcp:connect"
+_IBKR_DEFAULT_SCOPE = "mcp.read"
+_IBKR_DEFAULT_USER_AGENT = "Hermes-Agent"
 
 
 def _is_figma_remote_mcp(
@@ -1651,6 +1689,78 @@ def _is_figma_remote_mcp(
     if "figma" in name and (not url or "figma" in base_url_hostname(url)):
         return True
     return False
+
+
+def _is_ibkr_public_mcp(
+    server_name: str | None = None,
+    server_url: str | None = None,
+) -> bool:
+    """True when this MCP server is IBKR's official public hosted endpoint."""
+    url = (server_url or "").lower()
+    name = (server_name or "").lower()
+    from utils import base_url_host_matches, base_url_hostname
+    if base_url_host_matches(url, "api.ibkr.com") and "/mcp" in url:
+        return True
+    if "ibkr" in name and (not url or "ibkr" in base_url_hostname(url)):
+        return True
+    return False
+
+
+def is_oauth_metadata_or_registration_url(
+    url: str,
+    *,
+    server_url: str | None = None,
+) -> bool:
+    """Whether *url* is an OAuth discovery/registration request Hermes should tune."""
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    if "/.well-known/" in path:
+        return True
+    if path.endswith("/register") or path == "/register":
+        return True
+    if server_url and _is_ibkr_public_mcp(server_url=server_url):
+        if parsed.netloc.lower() == "api.ibkr.com" and path.startswith("/oauth2/"):
+            return True
+    return False
+
+
+def oauth_flow_user_agent(cfg: dict) -> str | None:
+    """User-Agent to stamp onto OAuth discovery/registration requests."""
+    return token_request_user_agent(cfg)
+
+
+def prepare_oauth_flow_request(request, *, server_url: str | None, user_agent: str | None, context=None):
+    """Apply narrowly scoped compatibility fixes to SDK-generated OAuth requests."""
+    url = str(request.url)
+    if user_agent and is_oauth_metadata_or_registration_url(url, server_url=server_url):
+        request.headers["User-Agent"] = user_agent
+    # IBKR's protected-resource metadata names /oauth2 as the issuer, but its
+    # corresponding OASM declares the root origin. Normalize only this known
+    # provider defect before the SDK validates the document's issuer.
+    if context is not None and _is_ibkr_public_mcp(server_url=server_url):
+        if url.endswith("/register"):
+            import json
+            payload = json.loads(request.content.decode("utf-8"))
+            payload["scope"] = _IBKR_DEFAULT_SCOPE
+            context.client_metadata.scope = _IBKR_DEFAULT_SCOPE
+            headers = {
+                key: value
+                for key, value in request.headers.items()
+                if key.lower() not in {"content-length", "content-type", "host"}
+            }
+            headers["Content-Type"] = "application/json"
+            request = type(request)(
+                request.method,
+                url,
+                headers=headers,
+                content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            )
+        if (
+            url.startswith("https://api.ibkr.com/oauth2/.well-known/")
+            or "/.well-known/oauth-authorization-server/oauth2" in url
+        ):
+            context.auth_server_url = "https://api.ibkr.com"
+    return request
 
 
 def apply_oauth_provider_defaults(
@@ -1683,6 +1793,11 @@ def apply_oauth_provider_defaults(
         # POST (auth method client_secret_post).
         if not cfg.get("token_endpoint_auth_method"):
             cfg["token_endpoint_auth_method"] = "client_secret_post"
+    if _is_ibkr_public_mcp(server_name, server_url):
+        if not cfg.get("scope"):
+            cfg["scope"] = _IBKR_DEFAULT_SCOPE
+        if not cfg.get("user_agent"):
+            cfg["user_agent"] = _IBKR_DEFAULT_USER_AGENT
     return cfg
 
 
@@ -1952,5 +2067,6 @@ def build_oauth_auth(
         # where the browser round-trip is actually awaited.
         callback_handler=callback_handler,
         token_user_agent=token_request_user_agent(cfg),
+        oauth_flow_user_agent=oauth_flow_user_agent(cfg),
         **cimd_provider_kwargs(cfg),
     )

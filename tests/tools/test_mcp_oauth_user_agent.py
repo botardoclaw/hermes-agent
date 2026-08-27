@@ -11,6 +11,7 @@ constructor call.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,6 +23,7 @@ pytest.importorskip(
 )
 
 from tools.mcp_oauth import (  # noqa: E402 — after the SDK availability gate
+    apply_oauth_provider_defaults,
     build_oauth_auth,
     token_request_user_agent,
 )
@@ -68,6 +70,26 @@ def test_unset_user_agent_values_are_treated_as_absent(cfg):
 
 def test_user_agent_is_stripped():
     assert token_request_user_agent({"user_agent": "  UA/2 "}) == "UA/2"
+
+
+def test_ibkr_provider_defaults_are_safe_and_overrideable():
+    cfg = {}
+    apply_oauth_provider_defaults(
+        cfg,
+        server_name="ibkr",
+        server_url="https://api.ibkr.com/v1/api/mcp-public",
+    )
+    assert cfg["scope"] == "mcp.read"
+    assert cfg["user_agent"] == "Hermes-Agent"
+
+    explicit = {"scope": "mcp.write", "user_agent": "Custom-UA/9"}
+    apply_oauth_provider_defaults(
+        explicit,
+        server_name="ibkr",
+        server_url="https://api.ibkr.com/v1/api/mcp-public",
+    )
+    assert explicit["scope"] == "mcp.write"
+    assert explicit["user_agent"] == "Custom-UA/9"
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +197,99 @@ def test_user_agent_does_not_disturb_token_auth_preparation(tmp_path, monkeypatc
 
     assert exchange.headers["User-Agent"] == "UA/1"
     assert exchange.headers.get("Authorization", "").startswith("Basic ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("builder", [
+    pytest.param(build_oauth_auth, id="build_oauth_auth"),
+    pytest.param(_manager_builder, id="oauth_manager"),
+])
+async def test_ibkr_oauth_discovery_and_registration_requests_carry_user_agent(
+    builder, tmp_path, monkeypatch
+):
+    """IBKR needs the OAuth side-channel requests stamped with a stable UA.
+
+    The initial MCP probe stays untouched; the yielded metadata + registration
+    requests inside the SDK's 401 branch must carry Hermes' per-provider UA.
+    """
+    from tools.mcp_tool import sdk_httpx
+    httpx = sdk_httpx()
+    assert httpx is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    provider = builder(
+        "ibkr",
+        "https://api.ibkr.com/v1/api/mcp-public",
+        {},
+    )
+
+    req = httpx.Request("POST", "https://api.ibkr.com/v1/api/mcp-public")
+    flow = provider.async_auth_flow(req)
+
+    outbound = await flow.__anext__()
+    assert str(outbound.url) == "https://api.ibkr.com/v1/api/mcp-public"
+
+    fake_401 = httpx.Response(
+        401,
+        request=outbound,
+        headers={
+            "www-authenticate": (
+                'Bearer resource_metadata="'
+                'https://api.ibkr.com/v1/api/mcp-public/.well-known/oauth-protected-resource"'
+            )
+        },
+    )
+
+    prm_req = await flow.asend(fake_401)
+    assert str(prm_req.url).endswith("/.well-known/oauth-protected-resource")
+    assert prm_req.headers.get("User-Agent") == "Hermes-Agent"
+
+    prm_resp = httpx.Response(
+        200,
+        request=prm_req,
+        headers={"content-type": "application/json"},
+        content=json.dumps({
+            "resource": "https://api.ibkr.com/v1/api/mcp-public",
+            "authorization_servers": ["https://api.ibkr.com/oauth2"],
+            "scopes_supported": ["mcp.read", "mcp.write"],
+            "bearer_methods_supported": ["header"],
+        }).encode(),
+    )
+
+    asm_req = await flow.asend(prm_resp)
+    assert "/.well-known/" in str(asm_req.url)
+    assert asm_req.headers.get("User-Agent") == "Hermes-Agent"
+
+    asm_resp = httpx.Response(
+        200,
+        request=asm_req,
+        headers={"content-type": "application/json"},
+        content=json.dumps({
+            "issuer": "https://api.ibkr.com",
+            "authorization_endpoint": "https://api.ibkr.com/oauth2/authorize",
+            "token_endpoint": "https://api.ibkr.com/oauth2/api/v1/token",
+            "registration_endpoint": "https://api.ibkr.com/oauth2/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "code_challenge_methods_supported": ["S256"],
+        }).encode(),
+    )
+
+    register_req = await flow.asend(asm_resp)
+    assert str(register_req.url) == "https://api.ibkr.com/oauth2/register"
+    assert register_req.headers.get("User-Agent") == "Hermes-Agent"
+    assert register_req.headers.get("Content-Type") == "application/json"
+    body = json.loads(register_req.content.decode())
+    assert body["scope"] == "mcp.read"
+    assert provider.context.client_metadata.scope == "mcp.read"
+    assert body["token_endpoint_auth_method"] == "none"
+
+    bad_register = httpx.Response(
+        400,
+        request=register_req,
+        text="forced test stop",
+    )
+    with pytest.raises(Exception):
+        await flow.asend(bad_register)
