@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -150,6 +151,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             self.context.lock = anyio.Semaphore(1, max_value=1)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_refresh_lock_file = None
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -195,10 +197,103 @@ def _make_hermes_provider_class() -> Optional[type]:
             request = await super()._exchange_token_authorization_code(*args, **kwargs)
             return self._stamp_token_user_agent(request)
 
+        async def _acquire_cross_process_refresh_lock(self) -> None:
+            """Serialize rotating refresh-token use across Hermes processes.
+
+            Cron workers, CLI probes, and the long-lived gateway share the same
+            token file.  Providers such as IBKR rotate the refresh token on
+            every successful refresh, so two processes refreshing the same
+            value concurrently leave the loser with ``invalid_grant``.  The
+            in-process SDK lock cannot prevent that race.
+
+            After acquiring the advisory file lock, reload the authoritative
+            disk token before constructing the refresh request.  A waiter will
+            therefore use the token written by the process that refreshed
+            first, rather than replaying the now-consumed value it held in
+            memory.
+            """
+            storage = self.context.storage
+            from tools.mcp_oauth import HermesTokenStorage
+
+            if not isinstance(storage, HermesTokenStorage):
+                return
+            try:
+                import fcntl
+            except ImportError:  # pragma: no cover - POSIX production hosts
+                return
+
+            lock_path = storage._tokens_path().with_suffix(".refresh.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(
+                str(lock_path),
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+            lock_file = os.fdopen(fd, "a+b", buffering=0)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30.0
+            waited = False
+            try:
+                while True:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        waited = True
+                        if loop.time() >= deadline:
+                            raise TimeoutError(
+                                "timed out waiting for the MCP OAuth refresh lock"
+                            )
+                        await asyncio.sleep(0.05)
+
+                self._hermes_refresh_lock_file = lock_file
+                disk_tokens = await storage.get_tokens()
+                if disk_tokens is not None:
+                    previous = self.context.current_tokens
+                    self.context.current_tokens = disk_tokens
+                    if disk_tokens.expires_in is not None:
+                        self.context.update_token_expiry(disk_tokens)
+                    if (
+                        waited
+                        or previous is None
+                        or previous.access_token != disk_tokens.access_token
+                    ):
+                        logger.info(
+                            "MCP OAuth '%s': refresh lock acquired; reloaded "
+                            "latest rotating credentials from disk",
+                            self._hermes_server_name,
+                        )
+            except BaseException:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_file.close()
+                raise
+
+        def _release_cross_process_refresh_lock(self) -> None:
+            lock_file = self._hermes_refresh_lock_file
+            self._hermes_refresh_lock_file = None
+            if lock_file is None:
+                return
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            finally:
+                lock_file.close()
+
         async def _refresh_token(self):
-            self._coerce_client_secret_post()
-            request = await super()._refresh_token()
-            return self._stamp_token_user_agent(request)
+            await self._acquire_cross_process_refresh_lock()
+            try:
+                self._coerce_client_secret_post()
+                request = await super()._refresh_token()
+                return self._stamp_token_user_agent(request)
+            except BaseException:
+                self._release_cross_process_refresh_lock()
+                raise
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -222,26 +317,29 @@ def _make_hermes_provider_class() -> Optional[type]:
 
         async def _handle_refresh_response(self, response) -> bool:
             """Accept any 2xx refresh response and avoid logging token bodies."""
-            if not (200 <= response.status_code < 300):
-                logger.warning("Token refresh failed: %s", response.status_code)
-                self.context.clear_tokens()
-                return False
-
-            from mcp.shared.auth import OAuthToken
-            from httpx import HTTPError
-            from pydantic import ValidationError
-
             try:
-                content = await response.aread()
-                token_response = OAuthToken.model_validate_json(content)
-                self.context.current_tokens = token_response
-                self.context.update_token_expiry(token_response)
-                await self.context.storage.set_tokens(token_response)
-                return True
-            except (HTTPError, ValidationError):
-                logger.warning("Invalid refresh response: %s", response.status_code)
-                self.context.clear_tokens()
-                return False
+                if not (200 <= response.status_code < 300):
+                    logger.warning("Token refresh failed: %s", response.status_code)
+                    self.context.clear_tokens()
+                    return False
+
+                from mcp.shared.auth import OAuthToken
+                from httpx import HTTPError
+                from pydantic import ValidationError
+
+                try:
+                    content = await response.aread()
+                    token_response = OAuthToken.model_validate_json(content)
+                    self.context.current_tokens = token_response
+                    self.context.update_token_expiry(token_response)
+                    await self.context.storage.set_tokens(token_response)
+                    return True
+                except (HTTPError, ValidationError):
+                    logger.warning("Invalid refresh response: %s", response.status_code)
+                    self.context.clear_tokens()
+                    return False
+            finally:
+                self._release_cross_process_refresh_lock()
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.
@@ -605,6 +703,10 @@ def _make_hermes_provider_class() -> Optional[type]:
                 self._persist_oauth_metadata_if_changed()
                 return
             finally:
+                # Network errors/cancellation can bypass
+                # _handle_refresh_response; never retain the process-wide
+                # advisory lock after the auth-flow generator exits.
+                self._release_cross_process_refresh_lock()
                 if resource_lock_released:
                     # Balance the SDK's surrounding ``async with`` even when
                     # HTTPX cancels or closes the flow while the resource

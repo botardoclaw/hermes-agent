@@ -127,6 +127,103 @@ async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_lock_serializes_processes_and_reloads_rotated_token(
+    tmp_path, monkeypatch
+):
+    """A refresh waiter must use the token persisted by the lock winner."""
+    import asyncio
+
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+
+    storage = HermesTokenStorage("ibkr")
+    original = OAuthToken(
+        access_token="access-0",
+        token_type="Bearer",
+        expires_in=0,
+        refresh_token="refresh-0",
+    )
+    await storage.set_tokens(original)
+
+    # Separate managers model the gateway and a cron/CLI worker. Their asyncio
+    # locks are independent; only the advisory file lock can serialize them.
+    provider_a = MCPOAuthManager().get_or_build_provider(
+        "ibkr", "https://api.ibkr.com/v1/api/mcp-public", {}
+    )
+    provider_b = MCPOAuthManager().get_or_build_provider(
+        "ibkr", "https://api.ibkr.com/v1/api/mcp-public", {}
+    )
+    provider_a.context.current_tokens = original
+    provider_b.context.current_tokens = original
+
+    await provider_a._acquire_cross_process_refresh_lock()
+    waiter = asyncio.create_task(provider_b._acquire_cross_process_refresh_lock())
+    await asyncio.sleep(0.1)
+    assert not waiter.done(), "second process must wait for the refresh owner"
+
+    rotated = OAuthToken(
+        access_token="access-1",
+        token_type="Bearer",
+        expires_in=599,
+        refresh_token="refresh-1",
+    )
+    await storage.set_tokens(rotated)
+    provider_a._release_cross_process_refresh_lock()
+
+    await asyncio.wait_for(waiter, timeout=2.0)
+    try:
+        assert provider_b.context.current_tokens.access_token == "access-1"
+        assert provider_b.context.current_tokens.refresh_token == "refresh-1"
+    finally:
+        provider_b._release_cross_process_refresh_lock()
+
+
+@pytest.mark.asyncio
+async def test_refresh_response_always_releases_cross_process_lock(
+    tmp_path, monkeypatch
+):
+    """A rejected refresh must not leave later processes deadlocked."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    token = OAuthToken(
+        access_token="access-0",
+        token_type="Bearer",
+        expires_in=0,
+        refresh_token="refresh-0",
+    )
+    await HermesTokenStorage("ibkr").set_tokens(token)
+
+    provider_a = MCPOAuthManager().get_or_build_provider(
+        "ibkr", "https://api.ibkr.com/v1/api/mcp-public", {}
+    )
+    provider_b = MCPOAuthManager().get_or_build_provider(
+        "ibkr", "https://api.ibkr.com/v1/api/mcp-public", {}
+    )
+    provider_a.context.current_tokens = token
+    provider_b.context.current_tokens = token
+
+    await provider_a._acquire_cross_process_refresh_lock()
+    response = SimpleNamespace(status_code=400)
+    assert await provider_a._handle_refresh_response(response) is False
+
+    await asyncio.wait_for(provider_b._acquire_cross_process_refresh_lock(), timeout=1.0)
+    provider_b._release_cross_process_refresh_lock()
+
+
+@pytest.mark.asyncio
 async def test_handle_401_tracks_inflight_task_to_prevent_gc(tmp_path, monkeypatch):
     """The 401 handler task must be strongly referenced by the manager.
 
