@@ -46,6 +46,17 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+class _RefreshSupersededByDiskToken(RuntimeError):
+    """A newer, still-valid token made an already-selected refresh unnecessary.
+
+    The SDK decides whether to refresh before calling ``_refresh_token``.  A
+    concurrent interactive authorization can write fresh credentials in the
+    narrow interval between that decision and our cross-process refresh lock.
+    Restarting the auth generator lets the SDK re-evaluate validity instead of
+    sending a refresh grant for credentials that are already usable.
+    """
+
+
 def _same_endpoint(a: str, b: str) -> bool:
     """Return True if two URLs target the same endpoint (ignoring query/fragment).
 
@@ -152,6 +163,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             self._hermes_server_name = server_name
             self._hermes_home = ""
             self._hermes_refresh_lock_file = None
+            self._hermes_refresh_superseded_by_disk_token = False
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -248,11 +260,22 @@ def _make_hermes_provider_class() -> Optional[type]:
 
                 self._hermes_refresh_lock_file = lock_file
                 disk_tokens = await storage.get_tokens()
+                self._hermes_refresh_superseded_by_disk_token = False
                 if disk_tokens is not None:
                     previous = self.context.current_tokens
                     self.context.current_tokens = disk_tokens
                     if disk_tokens.expires_in is not None:
                         self.context.update_token_expiry(disk_tokens)
+                    # A different access token means another process replaced
+                    # our credentials after the SDK had already selected its
+                    # refresh branch.  Only that transition can supersede the
+                    # branch; direct callers of _refresh_token() must keep
+                    # constructing their request for compatibility/testing.
+                    self._hermes_refresh_superseded_by_disk_token = bool(
+                        previous is not None
+                        and previous.access_token != disk_tokens.access_token
+                        and self.context.is_token_valid()
+                    )
                     if (
                         waited
                         or previous is None
@@ -287,6 +310,15 @@ def _make_hermes_provider_class() -> Optional[type]:
 
         async def _refresh_token(self):
             await self._acquire_cross_process_refresh_lock()
+            # The SDK decided that a refresh was needed *before* our lock
+            # reloaded the authoritative token file.  If another process has
+            # completed interactive authorization in that interval, the token
+            # we just loaded is valid.  Do not send its refresh token anyway:
+            # IBKR rotates/rejects these credentials and that needless request
+            # turns a successful login into an immediate reauth loop.
+            if self._hermes_refresh_superseded_by_disk_token:
+                self._release_cross_process_refresh_lock()
+                raise _RefreshSupersededByDiskToken()
             try:
                 self._coerce_client_secret_post()
                 request = await super()._refresh_token()
@@ -644,13 +676,34 @@ def _make_hermes_provider_class() -> Optional[type]:
             # generator via inner.asend(incoming), preserving the bidirectional
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
-            inner = super().async_auth_flow(request)
+            # ``OAuthClientProvider`` checks expiry before it enters
+            # ``_refresh_token``.  That check can race a concurrent
+            # interactive login.  If our refresh-lock hook discovers a fresh
+            # token, restart this not-yet-sent flow once so the base provider
+            # re-evaluates the now-valid token and emits the resource request.
+            refresh_restart_used = False
+            while True:
+                inner = super().async_auth_flow(request)
+                try:
+                    outgoing = await inner.__anext__()
+                    break
+                except StopAsyncIteration:
+                    self._persist_oauth_metadata_if_changed()
+                    return
+                except _RefreshSupersededByDiskToken:
+                    if refresh_restart_used:
+                        raise
+                    refresh_restart_used = True
+                    logger.info(
+                        "MCP OAuth '%s': skipped stale refresh decision after "
+                        "loading newer valid credentials from disk",
+                        self._hermes_server_name,
+                    )
             first_yield = True
             resource_lock_released = False
             sent_access_token = None
             retry_after_concurrent_auth = False
             try:
-                outgoing = await inner.__anext__()
                 while True:
                     if first_yield:
                         first_yield = False

@@ -224,6 +224,70 @@ async def test_refresh_response_always_releases_cross_process_lock(
 
 
 @pytest.mark.asyncio
+async def test_fresh_disk_token_supersedes_stale_refresh_decision(tmp_path, monkeypatch):
+    """An interactive login must not be immediately refreshed by a stale flow.
+
+    The SDK chooses the refresh branch before our cross-process lock reloads
+    credentials.  When that lock finds a fresh token written by another
+    process, the wrapper must restart the flow and send the resource request;
+    it must not send a refresh grant for the new token.
+    """
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    storage = HermesTokenStorage("ibkr")
+    fresh = OAuthToken(
+        access_token="fresh-access",
+        token_type="Bearer",
+        expires_in=599,
+        refresh_token="fresh-refresh",
+    )
+    await storage.set_tokens(fresh)
+
+    provider = MCPOAuthManager().get_or_build_provider(
+        "ibkr", "https://api.ibkr.com/v1/api/mcp-public", {}
+    )
+    assert provider is not None
+    provider._initialized = True
+    expired = OAuthToken(
+        access_token="stale-access",
+        token_type="Bearer",
+        expires_in=0,
+        refresh_token="stale-refresh",
+    )
+    provider.context.current_tokens = expired
+    provider.context.update_token_expiry(expired)
+    redirect_uri = str(provider.context.client_metadata.redirect_uris[0])
+    provider.context.client_info = OAuthClientInformationFull.model_validate({
+        "client_id": "test-client",
+        "redirect_uris": [redirect_uri],
+    })
+
+    refresh_calls = 0
+
+    async def fake_base_flow(self, request):
+        nonlocal refresh_calls
+        async with self.context.lock:
+            if not self.context.is_token_valid() and self.context.can_refresh_token():
+                refresh_calls += 1
+                await self._refresh_token()
+            yield request
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
+    request = object()
+    flow = provider.async_auth_flow(request)
+    assert await flow.__anext__() is request
+    assert refresh_calls == 1
+    assert provider.context.current_tokens.access_token == "fresh-access"
+    await flow.aclose()
+
+
+@pytest.mark.asyncio
 async def test_handle_401_tracks_inflight_task_to_prevent_gc(tmp_path, monkeypatch):
     """The 401 handler task must be strongly referenced by the manager.
 
