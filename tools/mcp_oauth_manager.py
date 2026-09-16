@@ -353,6 +353,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 if not (200 <= response.status_code < 300):
                     logger.warning("Token refresh failed: %s", response.status_code)
                     self.context.clear_tokens()
+                    await self.context.storage.clear_tokens()
                     return False
 
                 from mcp.shared.auth import OAuthToken

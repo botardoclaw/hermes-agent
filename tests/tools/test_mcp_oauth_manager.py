@@ -218,6 +218,7 @@ async def test_refresh_response_always_releases_cross_process_lock(
     await provider_a._acquire_cross_process_refresh_lock()
     response = SimpleNamespace(status_code=400)
     assert await provider_a._handle_refresh_response(response) is False
+    assert await HermesTokenStorage("ibkr").get_tokens() is None
 
     await asyncio.wait_for(provider_b._acquire_cross_process_refresh_lock(), timeout=1.0)
     provider_b._release_cross_process_refresh_lock()

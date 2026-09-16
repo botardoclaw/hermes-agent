@@ -544,6 +544,15 @@ class HermesTokenStorage:
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
+    async def clear_tokens(self) -> None:
+        """Remove only persisted tokens, retaining client registration metadata.
+
+        A rejected refresh token cannot become valid by being retried. Removing
+        it prevents future gateway processes from reloading the same expired
+        credential and hammering the authorization server in a reauth loop.
+        """
+        self._tokens_path().unlink(missing_ok=True)
+
     # -- client info -------------------------------------------------------
 
     async def get_client_info(self) -> "OAuthClientInformationFull | None":
