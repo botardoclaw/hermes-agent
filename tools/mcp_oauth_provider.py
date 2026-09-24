@@ -323,6 +323,7 @@ class HermesProviderMixin:
                 )
                 return True
             self.context.clear_tokens()
+            await self._hermes_clear_persisted_tokens()
             return False
         from httpx import HTTPError
         from mcp.shared.auth import OAuthToken
@@ -345,6 +346,17 @@ class HermesProviderMixin:
                 token_response.scope = prior.scope
         await self._store_tokens(token_response)
         return True
+
+    async def _hermes_clear_persisted_tokens(self) -> None:
+        """Discard a rejected refresh token without losing client registration.
+
+        A 400 after the peer-rotation check means the persisted grant is dead.
+        Keeping it makes each later process retry the same credential forever.
+        """
+        storage = getattr(self, "context").storage
+        clear = getattr(storage, "clear_tokens", None)
+        if clear is not None:
+            await clear()
 
     async def _hermes_reload_tokens_after_refresh_failure(self) -> bool:
         """Re-read tokens from disk after a rejected refresh.

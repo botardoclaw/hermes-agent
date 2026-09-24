@@ -484,6 +484,10 @@ class HermesTokenStorage:
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
+    async def clear_tokens(self) -> None:
+        """Remove rejected tokens while retaining OAuth client registration."""
+        self._tokens_path().unlink(missing_ok=True)
+
     def bind_issuer(self, issuer: str | None) -> None:
         """Set the authorization-server issuer stamped on future token writes."""
         self._bound_issuer = str(issuer) if issuer else None
