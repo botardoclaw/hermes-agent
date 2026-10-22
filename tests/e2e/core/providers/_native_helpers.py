@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
+import hermes_yaml as yaml
+from hermes_cli.observability.shared_metrics_consent import OFFER_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TURN_TIMEOUT = 180.0
@@ -93,6 +94,9 @@ def make_home(root: Path, model: dict[str, Any], *, env_file: dict[str, str] | N
         "updates": {"check": False},
         "auxiliary": {"title_generation": {"enabled": False}},
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        # Answered at the current offer version (as write_hermes_home does), so an interactive
+        # chat never stops on the shared-metrics offer before the UI takes the terminal.
+        "telemetry": {"shared_metrics": {"enabled": False, "send": False, "offer_version": OFFER_VERSION}},
     }
     for key, value in (extra_config or {}).items():
         if isinstance(value, dict) and isinstance(cfg.get(key), dict):
@@ -125,7 +129,7 @@ def run_chat(nh: NativeHome, prompt: str, *, resume: str | None = None, env: dic
         argv += ["--resume", resume]
     started = time.monotonic()
     proc = subprocess.run(argv, cwd=nh.project, env=nh.env(env), capture_output=True, text=True,
-                          timeout=timeout, stdin=subprocess.DEVNULL)
+                          timeout=timeout, stdin=subprocess.DEVNULL, check=False)
     return ChatResult(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
 
 
@@ -172,8 +176,9 @@ def tool_calls_of(row: dict[str, Any]) -> list[dict[str, Any]]:
 class KnownSymptom(AssertionError):
     """Raised ONLY at a tracked bug's exact symptom.
 
-    Every KNOWN strict xfail uses ``raises=KnownSymptom`` so a harness failure (process death, timeout,
-    precondition assert, fixture teardown error) fails for real instead of counting as the known bug.
+    It is the type ``known_gate``/``known_failure`` accept (``raises=KnownSymptom``), so a harness failure
+    (process death, timeout, precondition assert, fixture teardown error) fails for real instead of
+    counting as the known bug.
     """
 
 

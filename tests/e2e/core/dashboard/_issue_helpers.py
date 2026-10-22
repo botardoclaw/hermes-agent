@@ -8,8 +8,10 @@
 * ``GatewayApiServer``: a real ``python -m gateway.run`` with the API-server platform enabled via
   the profile ``.env`` exactly as a user configures it (``API_SERVER_ENABLED``/``_KEY``/``_HOST``/
   ``_PORT``), retrying the pick-then-bind port race like the parity lane's driver.
-* ``KnownIssue`` assertion subclasses: a strict xfail cell declares ``raises=<its subclass>`` so
-  only the bug's own signature is excused; a boot failure or any other assertion stays red.
+* ``KnownIssue`` assertion subclasses: a KNOWN cell gates its final check with
+  ``known_gate(KNOWN, name, raises=<its subclass>)`` (tests/e2e/core/_pending_fixes.py), so only the
+  bug's own signature is excused; a boot failure or any other assertion stays red, and the cell
+  simply passes once the fix lands.
 """
 
 from __future__ import annotations
@@ -48,14 +50,6 @@ class Issue120937(KnownIssue):
     """#120937: /api/sessions/{id}/chat silently truncates a long message."""
 
 
-def xfail_known(known: dict[str, tuple[str, type[KnownIssue]]], name: str):
-    """``pytest.mark.xfail(strict=True)`` for a KNOWN entry, excusing ONLY its issue's exception."""
-    import pytest
-
-    reason, exc = known[name]
-    return pytest.mark.xfail(strict=True, raises=exc, reason=reason)
-
-
 # Dashboard with a TTY stdin -----------------------------------------------------------------------
 
 
@@ -67,7 +61,7 @@ class PtyDashboard(Dashboard):
                  tty: bool = True) -> None:
         self.sb = sb
         self.log_path = log_path
-        self._log = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - closed in close()
+        self._log = open(log_path, "a", encoding="utf-8")
         if tty:
             self.pty_master, slave = os.openpty()
         else:
@@ -176,7 +170,7 @@ class GatewayApiServer:
             env_path.write_text(env_before + "".join(f"{k}={v}\n" for k, v in {
                 "API_SERVER_ENABLED": "true", "API_SERVER_KEY": self.key,
                 "API_SERVER_HOST": "127.0.0.1", "API_SERVER_PORT": str(port)}.items()), encoding="utf-8")
-            self._log = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - closed in stop()
+            self._log = open(log_path, "a", encoding="utf-8")
             self.proc = subprocess.Popen(
                 [sys.executable, "-m", "gateway.run"], cwd=str(sb.home), env=sb.env({"HERMES_HOME": str(hermes_home)}),
                 stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True,
