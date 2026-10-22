@@ -8,8 +8,11 @@ modules keep their own subclass (logger name, disk-watch hooks) on top of it.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -24,6 +27,33 @@ _ISS_OMITTING_ISSUERS = frozenset({"https://api.figma.com"})
 # Authorization-server metadata documents the SDK tries in its 401 branch (RFC 8414 / OIDC discovery).
 _ASM_DISCOVERY_PATHS = ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration")
 _DISCOVERY_CONTEXT_LEAD = "Could not read authorization-server metadata"
+
+# Never log arbitrary provider strings: even an `error` field can contain a
+# credential. Only these literal OAuth codes may cross the diagnostic boundary.
+_REFRESH_ERROR_CODES = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+    "unsupported_grant_type", "invalid_scope", "invalid_target", "access_denied",
+    "server_error", "temporarily_unavailable",
+})
+
+
+async def _refresh_error_code(response) -> str:
+    """Read only the structured error code; bodies/descriptions never escape.
+
+    Diagnostics are best-effort and must not change refresh recovery behavior.
+    Unknown vendor codes, malformed JSON, and read errors have one fixed value.
+    """
+    try:
+        body = await response.aread()
+        if len(body) > 16384:
+            return "unknown"
+        payload = json.loads(body)
+        code = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(code, str) and code in _REFRESH_ERROR_CODES:
+            return code
+    except Exception:
+        pass
+    return "unknown"
 
 
 def _default_auth_request_user_agent() -> str:
@@ -221,6 +251,83 @@ class HermesProviderMixin:
     # Locked descriptor while this provider owns the refresh fence; cleared by
     # _hermes_release_refresh_fence. Never shared across instances.
     _hermes_fence: int | None = None
+    _hermes_refresh_attempt: str | None = None
+
+    def _hermes_trace_refresh(self, event: str, **facts) -> None:
+        """IBKR-only, best-effort diagnostics with a closed, scalar-only schema.
+
+        Never retain token material (including fingerprints), request/response
+        objects, URLs, client identifiers or exceptions in a log record.
+        """
+        try:
+            attempt = self._hermes_refresh_attempt
+            if not attempt or event not in {
+                "attempt_started", "attempt_finished", "lock_acquired", "lock_released",
+                "lock_not_acquired", "disk_checked", "request_ready", "request_aborted",
+                "response", "persisted", "rejected_state_cleared",
+            }:
+                return
+            record = {"server": "ibkr", "pid": os.getpid(), "attempt": attempt, "event": event}
+            boolean_fields = {
+                "disk_present", "access_changed", "refresh_changed",
+                "issuer_binding_available", "issuer_binding_match",
+                "client_binding_available", "client_binding_match",
+                "client_issuer_available", "client_issuer_match",
+                "resource_present", "resource_match", "persistence_complete",
+            }
+            for key, value in facts.items():
+                if key in boolean_fields and type(value) is bool:
+                    record[key] = value
+                elif key == "status" and type(value) is int and 100 <= value <= 599:
+                    record[key] = value
+                elif key == "oauth_error" and value in _REFRESH_ERROR_CODES | {"unknown"}:
+                    record[key] = value
+            self._hermes_logger.info("MCP OAuth refresh lifecycle %s", json.dumps(record, sort_keys=True))
+        except Exception:
+            pass  # Diagnostics must not affect grant ownership or recovery.
+
+    def _hermes_trace_refresh_request(self, request) -> None:
+        """Compare binding inputs locally; output only availability/match booleans.
+
+        Client binding means disk registration vs in-memory registration, NOT
+        cryptographic proof of the opaque token's client. Do not call the SDK's
+        get_client_info here: its compatibility fixups can write credentials.
+        """
+        if not self._hermes_refresh_attempt:
+            return
+        try:
+            from urllib.parse import parse_qs
+            storage = self.context.storage
+            client = None
+            path = getattr(storage, "_client_info_path", None)
+            if path is not None:
+                try:
+                    with path().open("rb") as stream:
+                        raw = stream.read(65537)
+                    if len(raw) <= 65536:
+                        value = json.loads(raw)
+                        if isinstance(value, dict):
+                            client = value
+                except Exception:
+                    pass
+            disk_id = client.get("client_id") if client else None
+            memory_id = getattr(self.context.client_info, "client_id", None)
+            available = isinstance(disk_id, str) and bool(disk_id) and bool(memory_id)
+            issuer = _metadata_issuer(self.context)
+            client_issuer = client.get("issuer") if client else None
+            issuer_available = isinstance(client_issuer, str) and bool(client_issuer) and bool(issuer)
+            form = parse_qs(request.content.decode("utf-8"), keep_blank_values=True)
+            resources = form.get("resource", [])
+            self._hermes_trace_refresh(
+                "request_ready", client_binding_available=bool(available),
+                client_binding_match=bool(available and disk_id == memory_id),
+                client_issuer_available=bool(issuer_available),
+                client_issuer_match=bool(issuer_available and (client_issuer or "").rstrip("/") == issuer),
+                resource_present=bool(resources),
+                resource_match=resources == [self.context.get_resource_url()],
+            )
+        except Exception:
+            pass
 
     async def async_auth_flow(self, request):
         """Guarantee fence release even if the auth generator is abandoned.
@@ -323,8 +430,11 @@ class HermesProviderMixin:
                     # refresh token would only burn a generation on a single-use
                     # provider. Skip the POST and let the flow restart.
                     raise _RefreshCompletedByPeer
-            return self._prepare_token_request(await super()._refresh_token())
+            request = self._prepare_token_request(await super()._refresh_token())
+            self._hermes_trace_refresh_request(request)
+            return request
         except BaseException:
+            self._hermes_trace_refresh("request_aborted")
             # Never hold the fence when no POST will follow.
             await self._hermes_release_refresh_fence()
             raise
@@ -355,10 +465,24 @@ class HermesProviderMixin:
 
         await self._hermes_release_refresh_fence()
         storage = self.context.storage
+        # Only the local IBKR label is emitted, never arbitrary config strings.
+        if getattr(storage, "_server_name", None) == "ibkr":
+            try:
+                self._hermes_refresh_attempt = uuid.uuid4().hex
+                self._hermes_trace_refresh("attempt_started")
+            except Exception:
+                pass
         tokens_path = getattr(storage, "_tokens_path", None)
         if tokens_path is None:  # pragma: no cover - non-Hermes storage
             return
-        self._hermes_fence = await acquire_refresh_fence(tokens_path())
+        try:
+            self._hermes_fence = await acquire_refresh_fence(tokens_path())
+        except BaseException:
+            self._hermes_trace_refresh("lock_not_acquired")
+            self._hermes_trace_refresh("attempt_finished")
+            self._hermes_refresh_attempt = None
+            raise
+        self._hermes_trace_refresh("lock_acquired")
 
     async def _hermes_release_refresh_fence(self) -> None:
         """Release the fence if held. Idempotent and never raises."""
@@ -367,6 +491,9 @@ class HermesProviderMixin:
         fd, self._hermes_fence = self._hermes_fence, None
         if fd is not None:
             release_refresh_fence(fd)
+            self._hermes_trace_refresh("lock_released")
+        self._hermes_trace_refresh("attempt_finished")
+        self._hermes_refresh_attempt = None
 
     async def _hermes_rotated_candidate(self):
         """The on-disk pair, if a peer rotated it past the one we hold.
@@ -379,6 +506,21 @@ class HermesProviderMixin:
         ``get_tokens`` already returns None for absent or corrupt files.
         """
         stored = await self.context.storage.get_tokens()
+        if self._hermes_refresh_attempt:
+            try:
+                current = self.context.current_tokens
+                issuer = _metadata_issuer(self.context)
+                loaded = getattr(self.context.storage, "loaded_issuer", None)
+                available = isinstance(loaded, str) and bool(loaded) and bool(issuer)
+                self._hermes_trace_refresh(
+                    "disk_checked", disk_present=stored is not None,
+                    access_changed=getattr(stored, "access_token", None) != getattr(current, "access_token", None),
+                    refresh_changed=getattr(stored, "refresh_token", None) != getattr(current, "refresh_token", None),
+                    issuer_binding_available=bool(available),
+                    issuer_binding_match=bool(available and (loaded or "").rstrip("/") == issuer),
+                )
+            except Exception:
+                pass
         if stored is None:
             return None
         current = self.context.current_tokens
@@ -418,7 +560,12 @@ class HermesProviderMixin:
         self.context.current_tokens = token_response
         self.context.update_token_expiry(token_response)
         bind_issuer_from_context(self.context)
-        await self.context.storage.set_tokens(token_response)
+        try:
+            await self.context.storage.set_tokens(token_response)
+        except BaseException:
+            self._hermes_trace_refresh("persisted", persistence_complete=False)
+            raise
+        self._hermes_trace_refresh("persisted", persistence_complete=True)
 
     async def _handle_token_response(self, response):
         """Accept any 2xx token response; a 2xx body (it carries the tokens) never reaches an error.
@@ -452,7 +599,12 @@ class HermesProviderMixin:
 
     async def _hermes_handle_refresh_response(self, response) -> bool:
         if not (200 <= response.status_code < 300):
-            self._hermes_logger.warning("Token refresh failed: %s", response.status_code)
+            error_code = await _refresh_error_code(response)
+            self._hermes_trace_refresh("response", status=response.status_code, oauth_error=error_code)
+            self._hermes_logger.warning(
+                "Token refresh failed: %s (oauth_error=%s)",
+                response.status_code, error_code,
+            )
             # A writer outside the fence (interactive `hermes mcp login`, or a
             # pre-fence Hermes sharing this HERMES_HOME) may have rotated the
             # grant and persisted the replacement. Providers issuing single-use
@@ -465,7 +617,9 @@ class HermesProviderMixin:
                 return True
             self.context.clear_tokens()
             await self._hermes_clear_persisted_tokens()
+            self._hermes_trace_refresh("rejected_state_cleared")
             return False
+        self._hermes_trace_refresh("response", status=response.status_code)
         from httpx import HTTPError
         from mcp.shared.auth import OAuthToken
         from pydantic import ValidationError
